@@ -95,21 +95,14 @@ async function startScanner() {
   // - Tall scan region (PDF417 is stacked rows)
   // - Disable native BarcodeDetector path (PDF417 often fails there)
   const config = {
-    fps: 20,
+    fps: 8,
     disableFlip: false,
     // Big region (near full frame) helps PDF417 a lot
     qrbox: (vw, vh) => {
-  // Near-100% of the visible frame (safer than exactly 1.0)
-  const w = Math.floor(vw * 0.98);
-  const h = Math.floor(vh * 0.98);
-
-  // Keep dimensions even (some pipelines behave better with even sizes)
-  return {
-    width: w - (w % 2),
-    height: h - (h % 2),
-  };
-},
-
+      const w = Math.floor(Math.min(vw * 0.96, 1200));
+      const h = Math.floor(Math.min(vh * 0.70, 820));
+      return { width: w, height: h };
+    },
     experimentalFeatures: {
       // Force ZXing-js path for consistency (PDF417 especially)
       useBarCodeDetectorIfSupported: false,
