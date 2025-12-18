@@ -15,32 +15,39 @@ const btnScanAgain = el("btnScanAgain");
 const resultFormat = el("resultFormat");
 const resultText = el("resultText");
 
-// (Optional) status UI if you added it
-const statusPill = document.getElementById("statusPill");
-const startOverlay = document.getElementById("startOverlay");
-const btnStart = document.getElementById("btnStart");
-
 let html5QrCode = null;
-let scanning = false;
 let torchOn = false;
 let lastText = "";
-let lastFailureAt = 0;
-
-function setStatus(msg) {
-  if (statusPill) statusPill.textContent = msg;
-}
+let scanning = false;
 
 function isProbablyUrl(s) {
   try { new URL(s); return true; } catch { return false; }
+}
+
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.value = 880;
+    g.gain.value = 0.03;
+    o.connect(g); g.connect(ctx.destination);
+    o.start();
+    setTimeout(() => { o.stop(); ctx.close(); }, 120);
+  } catch { /* ignore */ }
+}
+
+function vibrate() {
+  if (navigator.vibrate) navigator.vibrate(80);
 }
 
 function showModal({ text, formatName }) {
   resultFormat.textContent = formatName || "—";
   resultText.textContent = text || "—";
 
-  const canOpen = isProbablyUrl(text);
-  btnOpen.disabled = !canOpen;
-  btnOpen.style.opacity = canOpen ? "1" : "0.5";
+  btnOpen.disabled = !isProbablyUrl(text);
+  btnOpen.style.opacity = btnOpen.disabled ? "0.5" : "1";
 
   modal.classList.remove("hidden");
 }
@@ -49,192 +56,148 @@ function hideModal() {
   modal.classList.add("hidden");
 }
 
-function supportedFormats() {
-  // Covers everything in your picture except “MS1 Plessey”
+async function setTorchVisibleIfSupported() {
+  // Html5Qrcode has applyVideoConstraints; check capabilities before showing torch button. :contentReference[oaicite:2]{index=2}
+  try {
+    const caps = await html5QrCode.getRunningTrackCapabilities?.();
+    const hasTorch = !!caps && ("torch" in caps || (caps.advanced && caps.advanced.some(a => "torch" in a)));
+    btnTorch.style.display = hasTorch ? "grid" : "none";
+  } catch {
+    btnTorch.style.display = "none";
+  }
+}
+
+async function toggleTorch() {
+  try {
+    torchOn = !torchOn;
+    await html5QrCode.applyVideoConstraints({
+      advanced: [{ torch: torchOn }]
+    });
+    btnTorch.style.opacity = torchOn ? "1" : "0.7";
+  } catch {
+    // If it fails on device/browser, hide it.
+    btnTorch.style.display = "none";
+  }
+}
+
+function supportedFormatsForYourImage() {
+  // Covers everything in your image EXCEPT “MS1 Plessey”.
+  // “Databar” == RSS_14 / RSS_EXPANDED (GS1 DataBar).
   return [
-    // 2D
     Html5QrcodeSupportedFormats.QR_CODE,
     Html5QrcodeSupportedFormats.AZTEC,
     Html5QrcodeSupportedFormats.DATA_MATRIX,
     Html5QrcodeSupportedFormats.PDF_417,
 
-    // 1D
     Html5QrcodeSupportedFormats.CODE_39,
     Html5QrcodeSupportedFormats.CODE_93,
     Html5QrcodeSupportedFormats.CODE_128,
     Html5QrcodeSupportedFormats.ITF,
-    Html5QrcodeSupportedFormats.CODABAR,
 
     Html5QrcodeSupportedFormats.EAN_13,
     Html5QrcodeSupportedFormats.EAN_8,
     Html5QrcodeSupportedFormats.UPC_A,
     Html5QrcodeSupportedFormats.UPC_E,
 
-    // GS1 DataBar (Databar)
+    Html5QrcodeSupportedFormats.CODABAR,
+
     Html5QrcodeSupportedFormats.RSS_14,
     Html5QrcodeSupportedFormats.RSS_EXPANDED,
   ];
 }
 
-async function startScanner() {
+async function start() {
   if (scanning) return;
 
-  if (!window.Html5Qrcode) {
-    alert("html5-qrcode did not load. Check your script tag / CDN.");
-    return;
-  }
-
-  setStatus("Starting camera…");
-
+  // html5-qrcode injects its own <video> under #reader.
   html5QrCode = new Html5Qrcode("reader", {
-    formatsToSupport: supportedFormats(),
+    formatsToSupport: supportedFormatsForYourImage()
   });
 
-  // IMPORTANT for PDF417:
-  // - Lower FPS (more time per frame decode)
-  // - Tall scan region (PDF417 is stacked rows)
-  // - Disable native BarcodeDetector path (PDF417 often fails there)
   const config = {
-    fps: 8,
+    fps: 12,
+    // Keep scanning area large for 1D codes; the overlay is purely visual.
+    aspectRatio: 1.777778,
     disableFlip: false,
-    // Big region (near full frame) helps PDF417 a lot
-    qrbox: (vw, vh) => {
-      const w = Math.floor(Math.min(vw * 0.96, 1200));
-      const h = Math.floor(Math.min(vh * 0.70, 820));
-      return { width: w, height: h };
-    },
-    experimentalFeatures: {
-      // Force ZXing-js path for consistency (PDF417 especially)
-      useBarCodeDetectorIfSupported: false,
-    },
+    // Optional: enable BarcodeDetector (experimental) if supported by browser.
+    // experimentalFeatures: { useBarCodeDetectorIfSupported: true }
   };
 
   const onSuccess = async (decodedText, decodedResult) => {
-    if (!decodedText) return;
-
-    // simple de-dupe
-    if (decodedText === lastText) return;
+    // basic de-dupe so it doesn’t spam the modal
+    if (!decodedText || decodedText === lastText) return;
     lastText = decodedText;
 
-    console.log("SCAN SUCCESS:", decodedText, decodedResult);
-    setStatus("Scanned");
+    beep();
+    vibrate();
 
-    // Stop scanning while modal is open (more stable than pause on some devices)
-    try { await html5QrCode.stop(); } catch {}
-    scanning = false;
+    // Pause scanning while showing modal
+    try { await html5QrCode.pause?.(true); } catch { /* ignore */ }
 
-    const fmt =
-      decodedResult?.result?.format?.formatName ||
-      decodedResult?.decodedResult?.format ||
-      decodedResult?.formatName ||
-      "Unknown";
+    const fmt = decodedResult?.result?.format?.formatName
+      || decodedResult?.result?.format?.format
+      || decodedResult?.decodedResult?.format
+      || decodedResult?.format?.formatName
+      || decodedResult?.format?.name
+      || decodedResult?.formatName
+      || "Unknown";
 
     showModal({ text: decodedText, formatName: fmt });
   };
 
-  const onFailure = (_err) => {
-    // Called frequently; keep light
-    lastFailureAt = Date.now();
+  const onError = (_err) => {
+    // ignore per-frame decode errors
   };
 
-  // Ask for higher resolution (PDF417 needs pixels)
-  const cameraConstraints = {
-    facingMode: { ideal: "environment" },
-    width: { ideal: 1920 },
-    height: { ideal: 1080 },
-  };
+  scanning = true;
 
-  try {
-    await html5QrCode.start(cameraConstraints, config, onSuccess, onFailure);
-    scanning = true;
-    setStatus("Scanning…");
-  } catch (e) {
-    console.error(e);
-    setStatus("Camera error");
-    alert(
-      "Camera start failed.\n" +
-      "1) Allow camera permission\n" +
-      "2) Must be HTTPS (GitHub Pages)\n" +
-      (e?.message || e)
-    );
-  }
+  // Prefer rear camera
+  await html5QrCode.start(
+    { facingMode: "environment" },
+    config,
+    onSuccess,
+    onError
+  );
+
+  await setTorchVisibleIfSupported();
 }
 
-async function restartScanner() {
+async function resumeScanning() {
   hideModal();
-  lastText = "";
+  lastText = ""; // allow scanning same code again
+  try { await html5QrCode.resume?.(); } catch { /* ignore */ }
+}
 
+async function stopAndExit() {
   try {
     if (html5QrCode) {
+      await html5QrCode.stop();
       await html5QrCode.clear();
     }
-  } catch {}
-
-  scanning = false;
-  await startScanner();
-}
-
-async function stopScanner() {
-  try {
-    if (html5QrCode) {
-      if (scanning) await html5QrCode.stop();
-      await html5QrCode.clear();
-    }
-  } catch {}
+  } catch { /* ignore */ }
   scanning = false;
   hideModal();
-  setStatus("Stopped");
+  alert("Scanner stopped.");
 }
 
-async function toggleTorch() {
-  try {
-    torchOn = !torchOn;
-    await html5QrCode.applyVideoConstraints({ advanced: [{ torch: torchOn }] });
-    btnTorch.style.opacity = torchOn ? "1" : "0.7";
-  } catch {
-    // if unsupported on device/browser, hide it
-    btnTorch.style.display = "none";
-  }
-}
-
-// Optional: status heartbeat (shows it is running)
-setInterval(() => {
-  if (!scanning) return;
-  const age = Date.now() - lastFailureAt;
-  if (age > 1400) setStatus("Point camera at a barcode…");
-  else setStatus("Scanning…");
-}, 700);
-
-// UI bindings
-btnTorch?.addEventListener("click", () => toggleTorch());
-
-btnHelp?.addEventListener("click", () => {
+btnTorch.addEventListener("click", () => toggleTorch());
+btnHelp.addEventListener("click", () => {
   alert(
     [
-      "Supported here:",
+      "Supported (this app):",
       "UPC-A / UPC-E, EAN-13 / EAN-8, Code 39, Code 93, Code 128, ITF, Codabar,",
       "QR, Data Matrix, PDF417, Aztec, GS1 DataBar (RSS-14 / RSS-Expanded).",
       "",
-      "Not supported: MS1 Plessey (not available in html5-qrcode formats).",
-      "",
-      "PDF417 tips:",
-      "- Bright light / torch",
-      "- Hold steady, reduce angle/skew",
-      "- Move closer until it is sharp",
+      "Not supported here: MS1 Plessey (not available in html5-qrcode supported formats)."
     ].join("\n")
   );
 });
+btnClose.addEventListener("click", () => stopAndExit());
 
-btnClose?.addEventListener("click", async () => {
-  await stopScanner();
-  alert("Scanner stopped.");
-});
+btnModalClose.addEventListener("click", () => resumeScanning());
+btnScanAgain.addEventListener("click", () => resumeScanning());
 
-// Modal actions
-btnModalClose?.addEventListener("click", () => restartScanner());
-btnScanAgain?.addEventListener("click", () => restartScanner());
-
-btnCopy?.addEventListener("click", async () => {
+btnCopy.addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(resultText.textContent || "");
     btnCopy.textContent = "Copied";
@@ -244,23 +207,22 @@ btnCopy?.addEventListener("click", async () => {
   }
 });
 
-btnOpen?.addEventListener("click", () => {
+btnOpen.addEventListener("click", () => {
   const text = resultText.textContent || "";
   if (!isProbablyUrl(text)) return;
   window.open(text, "_blank", "noopener,noreferrer");
 });
 
-// Start strategy:
-// - If you added Tap-to-start overlay, use it.
-// - Otherwise start on load.
-if (btnStart && startOverlay) {
-  setStatus("Not started");
-  btnStart.addEventListener("click", async () => {
-    startOverlay.classList.add("hidden");
-    await startScanner();
+window.addEventListener("load", () => {
+  // getUserMedia requires HTTPS secure context (GitHub Pages is fine). :contentReference[oaicite:3]{index=3}
+  start().catch((e) => {
+    console.error(e);
+    alert(
+      "Camera start failed.\n" +
+      "- Use HTTPS (GitHub Pages).\n" +
+      "- Allow camera permission.\n" +
+      "- On iOS, use Safari (iOS support depends on version)."
+    );
   });
-} else {
-  window.addEventListener("load", () => {
-    startScanner();
-  });
-}
+});
+
